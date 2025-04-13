@@ -324,10 +324,11 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
     # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
     # states_tmp2 = _chunk_state_fwd(B[:, 147:256], x[:, 147:256], dt_tmp2, dA_cumsum_tmp2, states_in_fp32=True)
-    states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
-                                              initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
+    states, final_states = _state_passing_fwd(states.view(*states.size()[:-2], -1), dA_cumsum[:, :, :, -1],
+                                              initial_states=initial_states.view(*initial_states.size()[:-2], -1) if initial_states is not None else None,
                                               seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
-    states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
+    # states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
+    states, final_states = [t.view(*t.size()[:-1], -1, dstate) for t in [states, final_states]]
     # states_tmp0 = rearrange(_state_passing_fwd(rearrange(states_tmp0, "... p n -> ... (p n)"), dA_cumsum_tmp0[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     # states_tmp1 = rearrange(_state_passing_fwd(rearrange(states_tmp1, "... p n -> ... (p n)"), dA_cumsum_tmp1[:, :, :, -1], chunk_size=chunk_size), "... (p n) -> ... p n", n=dstate)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
@@ -761,6 +762,29 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
     return rearrange(out, "b s h p -> b s (h p)")
 
 
+@torch.library.custom_op("mamba_ssm::causal_conv1d_fwd", mutates_args={})
+def causal_conv1d_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    seq_idx: int | None,
+    activation: str | None,
+) -> torch.Tensor:
+    return causal_conv1d_cuda.causal_conv1d_fwd(
+        x, weight, bias, seq_idx, None, None, activation in ["silu", "swish"])
+
+
+@causal_conv1d_fwd.register_fake
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    seq_idx: int | None,
+    activation: str | None,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
@@ -785,16 +809,20 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         assert A.shape == (nheads,)
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
-        xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange_and_update_stride(xBC, "b s d -> b d s"),
-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
-            "b d s -> b s d"
-        )
+
+        # bsd -> bds
+        xBC = xBC.permute(0, 2, 1)
+        xBC = xBC.contiguous() if xBC.stride(2) % 8 != 0 else xBC
+
+        xBC_conv = causal_conv1d_fwd(xBC, conv1d_weight, conv1d_bias, seq_idx, activation)
+        # bds -> bsd
+        xBC_conv = xBC_conv.permute(0, 2, 1)
+
         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
-        x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
-        B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
-        C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
-        z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+        x = x.view(batch, seqlen, nheads, -1)
+        B = B.view(batch, seqlen, ngroups, -1)
+        C = C.view(batch, seqlen, ngroups, -1)
+        z = z.view(batch, seqlen, nheads, -1) if z is not None else None
         if rmsnorm_weight is None:
             out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
             out = rearrange(out, "b s h p -> b s (h p)")
@@ -804,8 +832,9 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         else:
             out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
             # reshape input data into 2D tensor
-            x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
-            z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+            # x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
+            x_rms = out_x.view(out_x.size(0) * out_x.size(1), -1)
+            z_rms = z.view(z.size(0) * z.size(1), -1)
             rmsnorm_weight = rmsnorm_weight.contiguous()
             if d_nonssm == 0:
                 out = None
@@ -817,7 +846,8 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
                                            group_size=dim // ngroups,
                                            norm_before_gate=norm_before_gate, is_rms_norm=True)
             if d_nonssm == 0:
-                out = rearrange(out, "(b s) d -> b s d", b=batch)
+                out = out.view(batch, -1, out.size(-1))
+                # out = rearrange(out, "(b s) d -> b s d", b=batch)
             else:
                 out = out01
         ctx.outproj_weight_dtype = outproj_weight.dtype if outproj_weight is not None else None
@@ -922,6 +952,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
 
 
+@torch.compile(fullgraph=True)
 def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
     """
     Argument:
